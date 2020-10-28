@@ -41,21 +41,31 @@ var manifestMergerRule = pctx.AndroidStaticRule("manifestMerger",
 	},
 	"args", "libs")
 
+// These two libs are added as optional dependencies (<uses-library> with
+// android:required set to false). This is because they haven't existed in pre-P
+// devices, but classes in them were in bootclasspath jars, etc. So making them
+// hard dependencies (android:required=true) would prevent apps from being
+// installed to such legacy devices.
+var optionalUsesLibs = []string{
+	"android.test.base",
+	"android.test.mock",
+}
+
 // Uses manifest_fixer.py to inject minSdkVersion, etc. into an AndroidManifest.xml
-func manifestFixer(ctx android.ModuleContext, manifest android.Path, sdkContext sdkContext,
-	isLibrary, uncompressedJNI, usesNonSdkApis, useEmbeddedDex bool) android.Path {
+func manifestFixer(ctx android.ModuleContext, manifest android.Path, sdkContext sdkContext, sdkLibraries []string,
+	isLibrary, useEmbeddedNativeLibs, usesNonSdkApis, useEmbeddedDex, hasNoCode bool, loggingParent string) android.Path {
 
 	var args []string
 	if isLibrary {
 		args = append(args, "--library")
 	} else {
-		minSdkVersion, err := sdkVersionToNumber(ctx, sdkContext.minSdkVersion())
+		minSdkVersion, err := sdkContext.minSdkVersion().effectiveVersion(ctx)
 		if err != nil {
 			ctx.ModuleErrorf("invalid minSdkVersion: %s", err)
 		}
 		if minSdkVersion >= 23 {
-			args = append(args, fmt.Sprintf("--extract-native-libs=%v", !uncompressedJNI))
-		} else if uncompressedJNI {
+			args = append(args, fmt.Sprintf("--extract-native-libs=%v", !useEmbeddedNativeLibs))
+		} else if useEmbeddedNativeLibs {
 			ctx.ModuleErrorf("module attempted to store uncompressed native libraries, but minSdkVersion=%d doesn't support it",
 				minSdkVersion)
 		}
@@ -66,21 +76,47 @@ func manifestFixer(ctx android.ModuleContext, manifest android.Path, sdkContext 
 	}
 
 	if useEmbeddedDex {
-		args = append(args, "--use-embedded-dex=true")
+		args = append(args, "--use-embedded-dex")
 	}
 
+	for _, usesLib := range sdkLibraries {
+		if inList(usesLib, optionalUsesLibs) {
+			args = append(args, "--optional-uses-library", usesLib)
+		} else {
+			args = append(args, "--uses-library", usesLib)
+		}
+	}
+
+	if hasNoCode {
+		args = append(args, "--has-no-code")
+	}
+
+	if loggingParent != "" {
+		args = append(args, "--logging-parent", loggingParent)
+	}
 	var deps android.Paths
-	targetSdkVersion := sdkVersionOrDefault(ctx, sdkContext.targetSdkVersion())
-	if targetSdkVersion == ctx.Config().PlatformSdkCodename() &&
-		ctx.Config().UnbundledBuild() &&
-		!ctx.Config().UnbundledBuildUsePrebuiltSdks() &&
-		ctx.Config().IsEnvTrue("UNBUNDLED_BUILD_TARGET_SDK_WITH_API_FINGERPRINT") {
-		apiFingerprint := ApiFingerprintPath(ctx)
-		targetSdkVersion += fmt.Sprintf(".$$(cat %s)", apiFingerprint.String())
-		deps = append(deps, apiFingerprint)
+	targetSdkVersion, err := sdkContext.targetSdkVersion().effectiveVersionString(ctx)
+	if err != nil {
+		ctx.ModuleErrorf("invalid targetSdkVersion: %s", err)
+	}
+	if UseApiFingerprint(ctx) {
+		targetSdkVersion = ctx.Config().PlatformSdkCodename() + fmt.Sprintf(".$$(cat %s)", ApiFingerprintPath(ctx).String())
+		deps = append(deps, ApiFingerprintPath(ctx))
+	}
+
+	minSdkVersion, err := sdkContext.minSdkVersion().effectiveVersionString(ctx)
+	if err != nil {
+		ctx.ModuleErrorf("invalid minSdkVersion: %s", err)
+	}
+	if UseApiFingerprint(ctx) {
+		minSdkVersion = ctx.Config().PlatformSdkCodename() + fmt.Sprintf(".$$(cat %s)", ApiFingerprintPath(ctx).String())
+		deps = append(deps, ApiFingerprintPath(ctx))
 	}
 
 	fixedManifest := android.PathForModuleOut(ctx, "manifest_fixer", "AndroidManifest.xml")
+	if err != nil {
+		ctx.ModuleErrorf("invalid minSdkVersion: %s", err)
+	}
 	ctx.Build(pctx, android.BuildParams{
 		Rule:        manifestFixerRule,
 		Description: "fix manifest",
@@ -88,7 +124,7 @@ func manifestFixer(ctx android.ModuleContext, manifest android.Path, sdkContext 
 		Implicits:   deps,
 		Output:      fixedManifest,
 		Args: map[string]string{
-			"minSdkVersion":    sdkVersionOrDefault(ctx, sdkContext.minSdkVersion()),
+			"minSdkVersion":    minSdkVersion,
 			"targetSdkVersion": targetSdkVersion,
 			"args":             strings.Join(args, " "),
 		},

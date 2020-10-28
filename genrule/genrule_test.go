@@ -51,18 +51,21 @@ func TestMain(m *testing.M) {
 	os.Exit(run())
 }
 
-func testContext(config android.Config, bp string,
-	fs map[string][]byte) *android.TestContext {
+func testContext(config android.Config) *android.TestContext {
 
 	ctx := android.NewTestArchContext()
-	ctx.RegisterModuleType("filegroup", android.ModuleFactoryAdaptor(android.FileGroupFactory))
-	ctx.RegisterModuleType("genrule", android.ModuleFactoryAdaptor(GenRuleFactory))
-	ctx.RegisterModuleType("gensrcs", android.ModuleFactoryAdaptor(GenSrcsFactory))
-	ctx.RegisterModuleType("genrule_defaults", android.ModuleFactoryAdaptor(defaultsFactory))
-	ctx.RegisterModuleType("tool", android.ModuleFactoryAdaptor(toolFactory))
-	ctx.PreArchMutators(android.RegisterDefaultsPreArchMutators)
-	ctx.Register()
+	ctx.RegisterModuleType("filegroup", android.FileGroupFactory)
+	ctx.RegisterModuleType("tool", toolFactory)
 
+	registerGenruleBuildComponents(ctx)
+
+	ctx.PreArchMutators(android.RegisterDefaultsPreArchMutators)
+	ctx.Register(config)
+
+	return ctx
+}
+
+func testConfig(bp string, fs map[string][]byte) android.Config {
 	bp += `
 		tool {
 			name: "tool",
@@ -104,7 +107,6 @@ func testContext(config android.Config, bp string,
 	`
 
 	mockFS := map[string][]byte{
-		"Android.bp": []byte(bp),
 		"tool":       nil,
 		"tool_file1": nil,
 		"tool_file2": nil,
@@ -119,9 +121,7 @@ func testContext(config android.Config, bp string,
 		mockFS[k] = v
 	}
 
-	ctx.MockFileSystem(mockFS)
-
-	return ctx
+	return android.TestArchConfig(buildDir, nil, bp, mockFS)
 }
 
 func TestGenruleCmd(t *testing.T) {
@@ -461,15 +461,15 @@ func TestGenruleCmd(t *testing.T) {
 
 	for _, test := range testcases {
 		t.Run(test.name, func(t *testing.T) {
-			config := android.TestArchConfig(buildDir, nil)
 			bp := "genrule {\n"
 			bp += "name: \"gen\",\n"
 			bp += test.prop
 			bp += "}\n"
 
+			config := testConfig(bp, nil)
 			config.TestProductVariables.Allow_missing_dependencies = proptools.BoolPtr(test.allowMissingDependencies)
 
-			ctx := testContext(config, bp, nil)
+			ctx := testContext(config)
 			ctx.SetAllowMissingDependencies(test.allowMissingDependencies)
 
 			_, errs := ctx.ParseFileList(".", []string{"Android.bp"})
@@ -502,6 +502,93 @@ func TestGenruleCmd(t *testing.T) {
 	}
 }
 
+func TestGenruleHashInputs(t *testing.T) {
+
+	// The basic idea here is to verify that the sbox command (which is
+	// in the Command field of the generate rule) contains a hash of the
+	// inputs, but only if $(in) is not referenced in the genrule cmd
+	// property.
+
+	// By including a hash of the inputs, we cause the rule to re-run if
+	// the list of inputs changes (because the sbox command changes).
+
+	// However, if the genrule cmd property already contains $(in), then
+	// the dependency is already expressed, so we don't need to include the
+	// hash in that case.
+
+	bp := `
+			genrule {
+				name: "hash0",
+				srcs: ["in1.txt", "in2.txt"],
+				out: ["out"],
+				cmd: "echo foo > $(out)",
+			}
+			genrule {
+				name: "hash1",
+				srcs: ["*.txt"],
+				out: ["out"],
+				cmd: "echo bar > $(out)",
+			}
+			genrule {
+				name: "hash2",
+				srcs: ["*.txt"],
+				out: ["out"],
+				cmd: "echo $(in) > $(out)",
+			}
+		`
+	testcases := []struct {
+		name         string
+		expectedHash string
+	}{
+		{
+			name: "hash0",
+			// sha256 value obtained from: echo -n 'in1.txtin2.txt' | sha256sum
+			expectedHash: "031097e11e0a8c822c960eb9742474f46336360a515744000d086d94335a9cb9",
+		},
+		{
+			name: "hash1",
+			// sha256 value obtained from: echo -n 'in1.txtin2.txtin3.txt' | sha256sum
+			expectedHash: "de5d22a4a7ab50d250cc59fcdf7a7e0775790d270bfca3a7a9e1f18a70dd996c",
+		},
+		{
+			name: "hash2",
+			// $(in) is present, option should not appear
+			expectedHash: "",
+		},
+	}
+
+	config := testConfig(bp, nil)
+	ctx := testContext(config)
+	_, errs := ctx.ParseFileList(".", []string{"Android.bp"})
+	if errs == nil {
+		_, errs = ctx.PrepareBuildActions(config)
+	}
+	if errs != nil {
+		t.Fatal(errs)
+	}
+
+	for _, test := range testcases {
+		t.Run(test.name, func(t *testing.T) {
+			gen := ctx.ModuleForTests(test.name, "")
+			command := gen.Rule("generator").RuleParams.Command
+
+			if len(test.expectedHash) > 0 {
+				// We add spaces before and after to make sure that
+				// this option doesn't abutt another sbox option.
+				expectedInputHashOption := " --input-hash " + test.expectedHash + " "
+
+				if !strings.Contains(command, expectedInputHashOption) {
+					t.Errorf("Expected command \"%s\" to contain \"%s\"", command, expectedInputHashOption)
+				}
+			} else {
+				if strings.Contains(command, "--input-hash") {
+					t.Errorf("Unexpected \"--input-hash\" found in command: \"%s\"", command)
+				}
+			}
+		})
+	}
+}
+
 func TestGenSrcs(t *testing.T) {
 	testcases := []struct {
 		name string
@@ -524,7 +611,7 @@ func TestGenSrcs(t *testing.T) {
 			cmds: []string{
 				"'bash -c '\\''out/tool in1.txt > __SBOX_OUT_DIR__/in1.h'\\'' && bash -c '\\''out/tool in2.txt > __SBOX_OUT_DIR__/in2.h'\\'''",
 			},
-			deps:  []string{buildDir + "/.intermediates/gen/gen/gensrcs/in1.h"},
+			deps:  []string{buildDir + "/.intermediates/gen/gen/gensrcs/in1.h", buildDir + "/.intermediates/gen/gen/gensrcs/in2.h"},
 			files: []string{buildDir + "/.intermediates/gen/gen/gensrcs/in1.h", buildDir + "/.intermediates/gen/gen/gensrcs/in2.h"},
 		},
 		{
@@ -539,21 +626,21 @@ func TestGenSrcs(t *testing.T) {
 				"'bash -c '\\''out/tool in1.txt > __SBOX_OUT_DIR__/in1.h'\\'' && bash -c '\\''out/tool in2.txt > __SBOX_OUT_DIR__/in2.h'\\'''",
 				"'bash -c '\\''out/tool in3.txt > __SBOX_OUT_DIR__/in3.h'\\'''",
 			},
-			deps:  []string{buildDir + "/.intermediates/gen/gen/gensrcs/in1.h"},
+			deps:  []string{buildDir + "/.intermediates/gen/gen/gensrcs/in1.h", buildDir + "/.intermediates/gen/gen/gensrcs/in2.h", buildDir + "/.intermediates/gen/gen/gensrcs/in3.h"},
 			files: []string{buildDir + "/.intermediates/gen/gen/gensrcs/in1.h", buildDir + "/.intermediates/gen/gen/gensrcs/in2.h", buildDir + "/.intermediates/gen/gen/gensrcs/in3.h"},
 		},
 	}
 
 	for _, test := range testcases {
 		t.Run(test.name, func(t *testing.T) {
-			config := android.TestArchConfig(buildDir, nil)
 			bp := "gensrcs {\n"
 			bp += `name: "gen",` + "\n"
 			bp += `output_extension: "h",` + "\n"
 			bp += test.prop
 			bp += "}\n"
 
-			ctx := testContext(config, bp, nil)
+			config := testConfig(bp, nil)
+			ctx := testContext(config)
 
 			_, errs := ctx.ParseFileList(".", []string{"Android.bp"})
 			if errs == nil {
@@ -595,7 +682,6 @@ func TestGenSrcs(t *testing.T) {
 }
 
 func TestGenruleDefaults(t *testing.T) {
-	config := android.TestArchConfig(buildDir, nil)
 	bp := `
 				genrule_defaults {
 					name: "gen_defaults1",
@@ -613,7 +699,8 @@ func TestGenruleDefaults(t *testing.T) {
 					defaults: ["gen_defaults1", "gen_defaults2"],
 				}
 			`
-	ctx := testContext(config, bp, nil)
+	config := testConfig(bp, nil)
+	ctx := testContext(config)
 	_, errs := ctx.ParseFileList(".", []string{"Android.bp"})
 	if errs == nil {
 		_, errs = ctx.PrepareBuildActions(config)

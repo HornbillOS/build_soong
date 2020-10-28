@@ -37,6 +37,7 @@ var (
 	keepOutDir    bool
 	copyAllOutput bool
 	depfileOut    string
+	inputHash     string
 )
 
 func init() {
@@ -54,6 +55,8 @@ func init() {
 	flag.StringVar(&depfileOut, "depfile-out", "",
 		"file path of the depfile to generate. This value will replace '__SBOX_DEPFILE__' in the command and will be treated as an output but won't be added to __SBOX_OUT_FILES__")
 
+	flag.StringVar(&inputHash, "input-hash", "",
+		"This option is ignored. Typical usage is to supply a hash of the list of input names so that the module will be rebuilt if the list (and thus the hash) changes.")
 }
 
 func usageViolation(violation string) {
@@ -62,7 +65,7 @@ func usageViolation(violation string) {
 	}
 
 	fmt.Fprintf(os.Stderr,
-		"Usage: sbox -c <commandToRun> --sandbox-path <sandboxPath> --output-root <outputRoot> [--depfile-out depFile] <outputFile> [<outputFile>...]\n"+
+		"Usage: sbox -c <commandToRun> --sandbox-path <sandboxPath> --output-root <outputRoot> [--depfile-out depFile] [--input-hash hash] <outputFile> [<outputFile>...]\n"+
 			"\n"+
 			"Deletes <outputRoot>,"+
 			"runs <commandToRun>,"+

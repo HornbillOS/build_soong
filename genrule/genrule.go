@@ -26,14 +26,23 @@ import (
 
 	"android/soong/android"
 	"android/soong/shared"
+	"crypto/sha256"
 	"path/filepath"
 )
 
 func init() {
-	android.RegisterModuleType("genrule_defaults", defaultsFactory)
+	registerGenruleBuildComponents(android.InitRegistrationContext)
+}
 
-	android.RegisterModuleType("gensrcs", GenSrcsFactory)
-	android.RegisterModuleType("genrule", GenRuleFactory)
+func registerGenruleBuildComponents(ctx android.RegistrationContext) {
+	ctx.RegisterModuleType("genrule_defaults", defaultsFactory)
+
+	ctx.RegisterModuleType("gensrcs", GenSrcsFactory)
+	ctx.RegisterModuleType("genrule", GenRuleFactory)
+
+	ctx.FinalDepsMutators(func(ctx android.RegisterMutatorsContext) {
+		ctx.BottomUp("genrule_tool_deps", toolDepsMutator).Parallel()
+	})
 }
 
 var (
@@ -48,6 +57,7 @@ var (
 )
 
 func init() {
+	pctx.Import("android/soong/android")
 	pctx.HostBinToolVariable("sboxCmd", "sbox")
 
 	pctx.HostBinToolVariable("soongZip", "soong_zip")
@@ -112,10 +122,12 @@ type generatorProperties struct {
 type Module struct {
 	android.ModuleBase
 	android.DefaultableModuleBase
+	android.ApexModuleBase
 
 	// For other packages to make their own genrules with extra
 	// properties
 	Extra interface{}
+	android.ImageInterface
 
 	properties generatorProperties
 
@@ -163,16 +175,14 @@ func (g *Module) GeneratedDeps() android.Paths {
 	return g.outputDeps
 }
 
-func (g *Module) DepsMutator(ctx android.BottomUpMutatorContext) {
+func toolDepsMutator(ctx android.BottomUpMutatorContext) {
 	if g, ok := ctx.Module().(*Module); ok {
 		for _, tool := range g.properties.Tools {
 			tag := hostToolDependencyTag{label: tool}
 			if m := android.SrcIsModule(tool); m != "" {
 				tool = m
 			}
-			ctx.AddFarVariationDependencies([]blueprint.Variation{
-				{Mutator: "arch", Variation: ctx.Config().BuildOsVariant},
-			}, tag, tool)
+			ctx.AddFarVariationDependencies(ctx.Config().BuildOSTarget.Variations(), tag, tool)
 		}
 	}
 }
@@ -300,14 +310,15 @@ func (g *Module) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 			addLocationLabel(out.Rel(), []string{filepath.Join("__SBOX_OUT_DIR__", out.Rel())})
 		}
 
+		referencedIn := false
 		referencedDepfile := false
 
-		rawCommand, err := android.Expand(task.cmd, func(name string) (string, error) {
+		rawCommand, err := android.ExpandNinjaEscaped(task.cmd, func(name string) (string, bool, error) {
 			// report the error directly without returning an error to android.Expand to catch multiple errors in a
 			// single run
-			reportError := func(fmt string, args ...interface{}) (string, error) {
+			reportError := func(fmt string, args ...interface{}) (string, bool, error) {
 				ctx.PropertyErrorf("cmd", fmt, args...)
-				return "SOONG_ERROR", nil
+				return "SOONG_ERROR", false, nil
 			}
 
 			switch name {
@@ -322,19 +333,20 @@ func (g *Module) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 					return reportError("default label %q has multiple files, use $(locations %s) to reference it",
 						firstLabel, firstLabel)
 				}
-				return locationLabels[firstLabel][0], nil
+				return locationLabels[firstLabel][0], false, nil
 			case "in":
-				return "${in}", nil
+				referencedIn = true
+				return "${in}", true, nil
 			case "out":
-				return "__SBOX_OUT_FILES__", nil
+				return "__SBOX_OUT_FILES__", false, nil
 			case "depfile":
 				referencedDepfile = true
 				if !Bool(g.properties.Depfile) {
 					return reportError("$(depfile) used without depfile property")
 				}
-				return "__SBOX_DEPFILE__", nil
+				return "__SBOX_DEPFILE__", false, nil
 			case "genDir":
-				return "__SBOX_OUT_DIR__", nil
+				return "__SBOX_OUT_DIR__", false, nil
 			default:
 				if strings.HasPrefix(name, "location ") {
 					label := strings.TrimSpace(strings.TrimPrefix(name, "location "))
@@ -342,10 +354,10 @@ func (g *Module) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 						if len(paths) == 0 {
 							return reportError("label %q has no files", label)
 						} else if len(paths) > 1 {
-							return reportError("label %q has multiple files, use $(locations %s) to reference 	it",
+							return reportError("label %q has multiple files, use $(locations %s) to reference it",
 								label, label)
 						}
-						return paths[0], nil
+						return paths[0], false, nil
 					} else {
 						return reportError("unknown location label %q", label)
 					}
@@ -355,7 +367,7 @@ func (g *Module) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 						if len(paths) == 0 {
 							return reportError("label %q has no files", label)
 						}
-						return strings.Join(paths, " "), nil
+						return strings.Join(paths, " "), false, nil
 					} else {
 						return reportError("unknown locations label %q", label)
 					}
@@ -389,8 +401,16 @@ func (g *Module) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 		// Escape the command for the shell
 		rawCommand = "'" + strings.Replace(rawCommand, "'", `'\''`, -1) + "'"
 		g.rawCommands = append(g.rawCommands, rawCommand)
-		sandboxCommand := fmt.Sprintf("rm -rf %s && $sboxCmd --sandbox-path %s --output-root %s -c %s %s $allouts",
-			task.genDir, sandboxPath, task.genDir, rawCommand, depfilePlaceholder)
+
+		sandboxCommand := fmt.Sprintf("rm -rf %s && $sboxCmd --sandbox-path %s --output-root %s",
+			task.genDir, sandboxPath, task.genDir)
+
+		if !referencedIn {
+			sandboxCommand = sandboxCommand + hashSrcFiles(srcFiles)
+		}
+
+		sandboxCommand = sandboxCommand + fmt.Sprintf(" -c %s %s $allouts",
+			rawCommand, depfilePlaceholder)
 
 		ruleParams := blueprint.RuleParams{
 			Command:     sandboxCommand,
@@ -433,9 +453,33 @@ func (g *Module) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 	}
 
 	g.outputFiles = outputFiles.Paths()
-	if len(g.outputFiles) > 0 {
-		g.outputDeps = append(g.outputDeps, g.outputFiles[0])
+
+	// For <= 6 outputs, just embed those directly in the users. Right now, that covers >90% of
+	// the genrules on AOSP. That will make things simpler to look at the graph in the common
+	// case. For larger sets of outputs, inject a phony target in between to limit ninja file
+	// growth.
+	if len(g.outputFiles) <= 6 {
+		g.outputDeps = g.outputFiles
+	} else {
+		phonyFile := android.PathForModuleGen(ctx, "genrule-phony")
+
+		ctx.Build(pctx, android.BuildParams{
+			Rule:   blueprint.Phony,
+			Output: phonyFile,
+			Inputs: g.outputFiles,
+		})
+
+		g.outputDeps = android.Paths{phonyFile}
 	}
+
+}
+
+func hashSrcFiles(srcFiles android.Paths) string {
+	h := sha256.New()
+	for _, src := range srcFiles {
+		h.Write([]byte(src.String()))
+	}
+	return fmt.Sprintf(" --input-hash %x", h.Sum(nil))
 }
 
 func (g *Module) generateSourceFile(ctx android.ModuleContext, task generateTask, rule blueprint.Rule) {
@@ -516,7 +560,19 @@ func generatorFactory(taskGenerator taskFunc, props ...interface{}) *Module {
 	module.AddProperties(props...)
 	module.AddProperties(&module.properties)
 
+	module.ImageInterface = noopImageInterface{}
+
 	return module
+}
+
+type noopImageInterface struct{}
+
+func (x noopImageInterface) ImageMutatorBegin(android.BaseModuleContext)                 {}
+func (x noopImageInterface) CoreVariantNeeded(android.BaseModuleContext) bool            { return false }
+func (x noopImageInterface) RamdiskVariantNeeded(android.BaseModuleContext) bool         { return false }
+func (x noopImageInterface) RecoveryVariantNeeded(android.BaseModuleContext) bool        { return false }
+func (x noopImageInterface) ExtraImageVariations(ctx android.BaseModuleContext) []string { return nil }
+func (x noopImageInterface) SetImageVariation(ctx android.BaseModuleContext, variation string, module android.Module) {
 }
 
 // replace "out" with "__SBOX_OUT_DIR__/<the value of ${out}>"
@@ -668,9 +724,6 @@ var String = proptools.String
 type Defaults struct {
 	android.ModuleBase
 	android.DefaultsModuleBase
-}
-
-func (*Defaults) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 }
 
 func defaultsFactory() android.Module {

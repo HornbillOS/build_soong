@@ -33,6 +33,8 @@ type RuleBuilder struct {
 	temporariesSet map[WritablePath]bool
 	restat         bool
 	sbox           bool
+	highmem        bool
+	remoteable     RemoteRuleSupports
 	sboxOutDir     WritablePath
 	missingDeps    []string
 }
@@ -84,6 +86,19 @@ func (r *RuleBuilder) Restat() *RuleBuilder {
 		panic("Restat() is not compatible with Sbox()")
 	}
 	r.restat = true
+	return r
+}
+
+// HighMem marks the rule as a high memory rule, which will limit how many run in parallel with other high memory
+// rules.
+func (r *RuleBuilder) HighMem() *RuleBuilder {
+	r.highmem = true
+	return r
+}
+
+// Remoteable marks the rule as supporting remote execution.
+func (r *RuleBuilder) Remoteable(supports RemoteRuleSupports) *RuleBuilder {
+	r.remoteable = supports
 	return r
 }
 
@@ -147,16 +162,17 @@ func (r *RuleBuilder) DeleteTemporaryFiles() {
 	r.Command().Text("rm").Flag("-f").Outputs(temporariesList)
 }
 
-// Inputs returns the list of paths that were passed to the RuleBuilderCommand methods that take input paths, such
-// as RuleBuilderCommand.Input, RuleBuilderComand.Implicit, or RuleBuilderCommand.FlagWithInput.  Inputs to a command
-// that are also outputs of another command in the same RuleBuilder are filtered out.
+// Inputs returns the list of paths that were passed to the RuleBuilderCommand methods that take
+// input paths, such as RuleBuilderCommand.Input, RuleBuilderComand.Implicit, or
+// RuleBuilderCommand.FlagWithInput.  Inputs to a command that are also outputs of another command
+// in the same RuleBuilder are filtered out.  The list is sorted and duplicates removed.
 func (r *RuleBuilder) Inputs() Paths {
 	outputs := r.outputSet()
 	depFiles := r.depFileSet()
 
 	inputs := make(map[string]Path)
 	for _, c := range r.commands {
-		for _, input := range c.inputs {
+		for _, input := range append(c.inputs, c.implicits...) {
 			inputStr := input.String()
 			if _, isOutput := outputs[inputStr]; !isOutput {
 				if _, isDepFile := depFiles[inputStr]; !isDepFile {
@@ -178,6 +194,28 @@ func (r *RuleBuilder) Inputs() Paths {
 	return inputList
 }
 
+// OrderOnlys returns the list of paths that were passed to the RuleBuilderCommand.OrderOnly or
+// RuleBuilderCommand.OrderOnlys.  The list is sorted and duplicates removed.
+func (r *RuleBuilder) OrderOnlys() Paths {
+	orderOnlys := make(map[string]Path)
+	for _, c := range r.commands {
+		for _, orderOnly := range c.orderOnlys {
+			orderOnlys[orderOnly.String()] = orderOnly
+		}
+	}
+
+	var orderOnlyList Paths
+	for _, orderOnly := range orderOnlys {
+		orderOnlyList = append(orderOnlyList, orderOnly)
+	}
+
+	sort.Slice(orderOnlyList, func(i, j int) bool {
+		return orderOnlyList[i].String() < orderOnlyList[j].String()
+	})
+
+	return orderOnlyList
+}
+
 func (r *RuleBuilder) outputSet() map[string]WritablePath {
 	outputs := make(map[string]WritablePath)
 	for _, c := range r.commands {
@@ -188,8 +226,9 @@ func (r *RuleBuilder) outputSet() map[string]WritablePath {
 	return outputs
 }
 
-// Outputs returns the list of paths that were passed to the RuleBuilderCommand methods that take output paths, such
-// as RuleBuilderCommand.Output, RuleBuilderCommand.ImplicitOutput, or RuleBuilderCommand.FlagWithInput.
+// Outputs returns the list of paths that were passed to the RuleBuilderCommand methods that take
+// output paths, such as RuleBuilderCommand.Output, RuleBuilderCommand.ImplicitOutput, or
+// RuleBuilderCommand.FlagWithInput.  The list is sorted and duplicates removed.
 func (r *RuleBuilder) Outputs() WritablePaths {
 	outputs := r.outputSet()
 
@@ -247,7 +286,8 @@ func (r *RuleBuilder) toolsSet() map[string]Path {
 	return tools
 }
 
-// Tools returns the list of paths that were passed to the RuleBuilderCommand.Tool method.
+// Tools returns the list of paths that were passed to the RuleBuilderCommand.Tool method.  The
+// list is sorted and duplicates removed.
 func (r *RuleBuilder) Tools() Paths {
 	toolsSet := r.toolsSet()
 
@@ -263,11 +303,36 @@ func (r *RuleBuilder) Tools() Paths {
 	return toolsList
 }
 
-// Commands returns a slice containing a the built command line for each call to RuleBuilder.Command.
+// RspFileInputs returns the list of paths that were passed to the RuleBuilderCommand.FlagWithRspFileInputList method.
+func (r *RuleBuilder) RspFileInputs() Paths {
+	var rspFileInputs Paths
+	for _, c := range r.commands {
+		if c.rspFileInputs != nil {
+			if rspFileInputs != nil {
+				panic("Multiple commands in a rule may not have rsp file inputs")
+			}
+			rspFileInputs = c.rspFileInputs
+		}
+	}
+
+	return rspFileInputs
+}
+
+// Commands returns a slice containing the built command line for each call to RuleBuilder.Command.
 func (r *RuleBuilder) Commands() []string {
 	var commands []string
 	for _, c := range r.commands {
-		commands = append(commands, string(c.buf))
+		commands = append(commands, c.String())
+	}
+	return commands
+}
+
+// NinjaEscapedCommands returns a slice containin the built command line after ninja escaping for each call to
+// RuleBuilder.Command.
+func (r *RuleBuilder) NinjaEscapedCommands() []string {
+	var commands []string
+	for _, c := range r.commands {
+		commands = append(commands, c.NinjaEscapedString())
 	}
 	return commands
 }
@@ -284,7 +349,7 @@ var _ BuilderContext = SingletonContext(nil)
 
 func (r *RuleBuilder) depFileMergerCmd(ctx PathContext, depFiles WritablePaths) *RuleBuilderCommand {
 	return r.Command().
-		Tool(ctx.Config().HostToolPath(ctx, "dep_fixer")).
+		BuiltTool(ctx, "dep_fixer").
 		Inputs(depFiles.Paths())
 }
 
@@ -297,6 +362,7 @@ func (r *RuleBuilder) Build(pctx PackageContext, ctx BuilderContext, name string
 		ctx.Build(pctx, BuildParams{
 			Rule:        ErrorRule,
 			Outputs:     r.Outputs(),
+			OrderOnly:   r.OrderOnlys(),
 			Description: desc,
 			Args: map[string]string{
 				"error": "missing dependencies: " + strings.Join(r.missingDeps, ", "),
@@ -324,7 +390,7 @@ func (r *RuleBuilder) Build(pctx PackageContext, ctx BuilderContext, name string
 	}
 
 	tools := r.Tools()
-	commands := r.Commands()
+	commands := r.NinjaEscapedCommands()
 	outputs := r.Outputs()
 
 	if len(commands) == 0 {
@@ -334,7 +400,7 @@ func (r *RuleBuilder) Build(pctx PackageContext, ctx BuilderContext, name string
 		panic("No outputs specified from any Commands")
 	}
 
-	commandString := strings.Join(proptools.NinjaEscapeList(commands), " && ")
+	commandString := strings.Join(commands, " && ")
 
 	if r.sbox {
 		sboxOutputs := make([]string, len(outputs))
@@ -348,7 +414,7 @@ func (r *RuleBuilder) Build(pctx PackageContext, ctx BuilderContext, name string
 		}
 
 		sboxCmd := &RuleBuilderCommand{}
-		sboxCmd.Tool(ctx.Config().HostToolPath(ctx, "sbox")).
+		sboxCmd.BuiltTool(ctx, "sbox").
 			Flag("-c").Text(commandString).
 			Flag("--sandbox-path").Text(shared.TempDirForOutDir(PathForOutput(ctx).String())).
 			Flag("--output-root").Text(r.sboxOutDir.String())
@@ -359,22 +425,45 @@ func (r *RuleBuilder) Build(pctx PackageContext, ctx BuilderContext, name string
 
 		sboxCmd.Flags(sboxOutputs)
 
-		commandString = string(sboxCmd.buf)
+		commandString = sboxCmd.buf.String()
 		tools = append(tools, sboxCmd.tools...)
 	}
 
 	// Ninja doesn't like multiple outputs when depfiles are enabled, move all but the first output to
-	// ImplicitOutputs.  RuleBuilder never uses "$out", so the distinction between Outputs and ImplicitOutputs
-	// doesn't matter.
+	// ImplicitOutputs.  RuleBuilder only uses "$out" for the rsp file location, so the distinction between Outputs and
+	// ImplicitOutputs doesn't matter.
 	output := outputs[0]
 	implicitOutputs := outputs[1:]
 
+	var rspFile, rspFileContent string
+	rspFileInputs := r.RspFileInputs()
+	if rspFileInputs != nil {
+		rspFile = "$out.rsp"
+		rspFileContent = "$in"
+	}
+
+	var pool blueprint.Pool
+	if ctx.Config().UseGoma() && r.remoteable.Goma {
+		// When USE_GOMA=true is set and the rule is supported by goma, allow jobs to run outside the local pool.
+	} else if ctx.Config().UseRBE() && r.remoteable.RBE {
+		// When USE_RBE=true is set and the rule is supported by RBE, use the remotePool.
+		pool = remotePool
+	} else if r.highmem {
+		pool = highmemPool
+	} else if ctx.Config().UseRemoteBuild() {
+		pool = localPool
+	}
+
 	ctx.Build(pctx, BuildParams{
 		Rule: ctx.Rule(pctx, name, blueprint.RuleParams{
-			Command:     commandString,
-			CommandDeps: tools.Strings(),
-			Restat:      r.restat,
+			Command:        commandString,
+			CommandDeps:    tools.Strings(),
+			Restat:         r.restat,
+			Rspfile:        rspFile,
+			RspfileContent: rspFileContent,
+			Pool:           pool,
 		}),
+		Inputs:          rspFileInputs,
 		Implicits:       r.Inputs(),
 		Output:          output,
 		ImplicitOutputs: implicitOutputs,
@@ -389,11 +478,17 @@ func (r *RuleBuilder) Build(pctx PackageContext, ctx BuilderContext, name string
 // RuleBuilderCommand, so they can be used chained or unchained.  All methods that add text implicitly add a single
 // space as a separator from the previous method.
 type RuleBuilderCommand struct {
-	buf      []byte
-	inputs   Paths
-	outputs  WritablePaths
-	depFiles WritablePaths
-	tools    Paths
+	buf           strings.Builder
+	inputs        Paths
+	implicits     Paths
+	orderOnlys    Paths
+	outputs       WritablePaths
+	depFiles      WritablePaths
+	tools         Paths
+	rspFileInputs Paths
+
+	// spans [start,end) of the command that should not be ninja escaped
+	unescapedSpans [][2]int
 
 	sbox       bool
 	sboxOutDir WritablePath
@@ -409,6 +504,20 @@ func (c *RuleBuilderCommand) addInput(path Path) string {
 	return path.String()
 }
 
+func (c *RuleBuilderCommand) addImplicit(path Path) string {
+	if c.sbox {
+		if rel, isRel, _ := maybeRelErr(c.sboxOutDir.String(), path.String()); isRel {
+			return "__SBOX_OUT_DIR__/" + rel
+		}
+	}
+	c.implicits = append(c.implicits, path)
+	return path.String()
+}
+
+func (c *RuleBuilderCommand) addOrderOnly(path Path) {
+	c.orderOnlys = append(c.orderOnlys, path)
+}
+
 func (c *RuleBuilderCommand) outputStr(path Path) string {
 	if c.sbox {
 		// Errors will be handled in RuleBuilder.Build where we have a context to report them
@@ -421,10 +530,10 @@ func (c *RuleBuilderCommand) outputStr(path Path) string {
 // Text adds the specified raw text to the command line.  The text should not contain input or output paths or the
 // rule will not have them listed in its dependencies or outputs.
 func (c *RuleBuilderCommand) Text(text string) *RuleBuilderCommand {
-	if len(c.buf) > 0 {
-		c.buf = append(c.buf, ' ')
+	if c.buf.Len() > 0 {
+		c.buf.WriteByte(' ')
 	}
-	c.buf = append(c.buf, text...)
+	c.buf.WriteString(text)
 	return c
 }
 
@@ -438,6 +547,16 @@ func (c *RuleBuilderCommand) Textf(format string, a ...interface{}) *RuleBuilder
 // rule will not have them listed in its dependencies or outputs.
 func (c *RuleBuilderCommand) Flag(flag string) *RuleBuilderCommand {
 	return c.Text(flag)
+}
+
+// OptionalFlag adds the specified raw text to the command line if it is not nil.  The text should not contain input or
+// output paths or the rule will not have them listed in its dependencies or outputs.
+func (c *RuleBuilderCommand) OptionalFlag(flag *string) *RuleBuilderCommand {
+	if flag != nil {
+		c.Text(*flag)
+	}
+
+	return c
 }
 
 // Flags adds the specified raw text to the command line.  The text should not contain input or output paths or the
@@ -479,6 +598,24 @@ func (c *RuleBuilderCommand) Tool(path Path) *RuleBuilderCommand {
 	return c.Text(path.String())
 }
 
+// BuiltTool adds the specified tool path that was built using a host Soong module to the command line.  The path will
+// be also added to the dependencies returned by RuleBuilder.Tools.
+//
+// It is equivalent to:
+//  cmd.Tool(ctx.Config().HostToolPath(ctx, tool))
+func (c *RuleBuilderCommand) BuiltTool(ctx PathContext, tool string) *RuleBuilderCommand {
+	return c.Tool(ctx.Config().HostToolPath(ctx, tool))
+}
+
+// PrebuiltBuildTool adds the specified tool path from prebuils/build-tools.  The path will be also added to the
+// dependencies returned by RuleBuilder.Tools.
+//
+// It is equivalent to:
+//  cmd.Tool(ctx.Config().PrebuiltBuildTool(ctx, tool))
+func (c *RuleBuilderCommand) PrebuiltBuildTool(ctx PathContext, tool string) *RuleBuilderCommand {
+	return c.Tool(ctx.Config().PrebuiltBuildTool(ctx, tool))
+}
+
 // Input adds the specified input path to the command line.  The path will also be added to the dependencies returned by
 // RuleBuilder.Inputs.
 func (c *RuleBuilderCommand) Input(path Path) *RuleBuilderCommand {
@@ -497,7 +634,7 @@ func (c *RuleBuilderCommand) Inputs(paths Paths) *RuleBuilderCommand {
 // Implicit adds the specified input path to the dependencies returned by RuleBuilder.Inputs without modifying the
 // command line.
 func (c *RuleBuilderCommand) Implicit(path Path) *RuleBuilderCommand {
-	c.addInput(path)
+	c.addImplicit(path)
 	return c
 }
 
@@ -505,7 +642,28 @@ func (c *RuleBuilderCommand) Implicit(path Path) *RuleBuilderCommand {
 // command line.
 func (c *RuleBuilderCommand) Implicits(paths Paths) *RuleBuilderCommand {
 	for _, path := range paths {
-		c.addInput(path)
+		c.addImplicit(path)
+	}
+	return c
+}
+
+// GetImplicits returns the command's implicit inputs.
+func (c *RuleBuilderCommand) GetImplicits() Paths {
+	return c.implicits
+}
+
+// OrderOnly adds the specified input path to the dependencies returned by RuleBuilder.OrderOnlys
+// without modifying the command line.
+func (c *RuleBuilderCommand) OrderOnly(path Path) *RuleBuilderCommand {
+	c.addOrderOnly(path)
+	return c
+}
+
+// OrderOnlys adds the specified input paths to the dependencies returned by RuleBuilder.OrderOnlys
+// without modifying the command line.
+func (c *RuleBuilderCommand) OrderOnlys(paths Paths) *RuleBuilderCommand {
+	for _, path := range paths {
+		c.addOrderOnly(path)
 	}
 	return c
 }
@@ -524,6 +682,15 @@ func (c *RuleBuilderCommand) Outputs(paths WritablePaths) *RuleBuilderCommand {
 		c.Output(path)
 	}
 	return c
+}
+
+// OutputDir adds the output directory to the command line. This is only available when used with RuleBuilder.Sbox,
+// and will be the temporary output directory managed by sbox, not the final one.
+func (c *RuleBuilderCommand) OutputDir() *RuleBuilderCommand {
+	if !c.sbox {
+		panic("OutputDir only valid with Sbox")
+	}
+	return c.Text("__SBOX_OUT_DIR__")
 }
 
 // DepFile adds the specified depfile path to the paths returned by RuleBuilder.DepFiles and adds it to the command
@@ -598,9 +765,54 @@ func (c *RuleBuilderCommand) FlagWithDepFile(flag string, path WritablePath) *Ru
 	return c.Text(flag + c.outputStr(path))
 }
 
+// FlagWithRspFileInputList adds the specified flag and path to an rspfile to the command line, with no separator
+// between them.  The paths will be written to the rspfile.
+func (c *RuleBuilderCommand) FlagWithRspFileInputList(flag string, paths Paths) *RuleBuilderCommand {
+	if c.rspFileInputs != nil {
+		panic("FlagWithRspFileInputList cannot be called if rsp file inputs have already been provided")
+	}
+
+	// Use an empty slice if paths is nil, the non-nil slice is used as an indicator that the rsp file must be
+	// generated.
+	if paths == nil {
+		paths = Paths{}
+	}
+
+	c.rspFileInputs = paths
+
+	rspFile := "$out.rsp"
+	c.FlagWithArg(flag, rspFile)
+	c.unescapedSpans = append(c.unescapedSpans, [2]int{c.buf.Len() - len(rspFile), c.buf.Len()})
+	return c
+}
+
 // String returns the command line.
 func (c *RuleBuilderCommand) String() string {
-	return string(c.buf)
+	return c.buf.String()
+}
+
+// String returns the command line.
+func (c *RuleBuilderCommand) NinjaEscapedString() string {
+	return ninjaEscapeExceptForSpans(c.String(), c.unescapedSpans)
+}
+
+func ninjaEscapeExceptForSpans(s string, spans [][2]int) string {
+	if len(spans) == 0 {
+		return proptools.NinjaEscape(s)
+	}
+
+	sb := strings.Builder{}
+	sb.Grow(len(s) * 11 / 10)
+
+	i := 0
+	for _, span := range spans {
+		sb.WriteString(proptools.NinjaEscape(s[i:span[0]]))
+		sb.WriteString(s[span[0]:span[1]])
+		i = span[1]
+	}
+	sb.WriteString(proptools.NinjaEscape(s[i:]))
+
+	return sb.String()
 }
 
 func ninjaNameEscape(s string) string {
